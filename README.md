@@ -58,6 +58,10 @@ cd patches
 
 想撤销：`.\apply-patch.ps1 -Revert`
 
+> 如果提示"无法加载文件，未对文件进行数字签名"，先跑一次
+> `powershell -ExecutionPolicy Bypass -File .\apply-patch.ps1`，或
+> `Set-ExecutionPolicy -Scope Process Bypass`。
+
 > **Steam 更新 EFZ 会冲掉这一行。** 更新后重跑一次脚本即可（脚本会识别"未打补丁"状态）。
 > 日志里如果出现 `[TW-TPADS] exit why=action`，就是这行被冲掉了。
 

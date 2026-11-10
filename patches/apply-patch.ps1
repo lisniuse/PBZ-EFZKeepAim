@@ -41,35 +41,58 @@ $NewBlock = @'
     end
 '@
 
+function Test-Dir([string]$p) {
+    # [System.IO.Directory]::Exists returns false for a missing drive instead of throwing
+    return [System.IO.Directory]::Exists($p)
+}
+
 function Find-EfzFolder {
     $roots = @()
-    if ($env:ProgramFiles) { $roots += (Join-Path $env:ProgramFiles 'Steam') }
-    if (${env:ProgramFiles(x86)}) { $roots += (Join-Path ${env:ProgramFiles(x86)} 'Steam') }
-    foreach ($extra in @('D:\Steam', 'D:\SteamLibrary', 'E:\SteamLibrary', 'D:\Games\Steam')) {
-        $roots += $extra
+
+    # 1) the registry knows where Steam itself is, wherever it was installed
+    foreach ($key in @('HKCU:\Software\Valve\Steam', 'HKLM:\SOFTWARE\WOW6432Node\Valve\Steam', 'HKLM:\SOFTWARE\Valve\Steam')) {
+        try {
+            $p = (Get-ItemProperty -Path $key -ErrorAction Stop).SteamPath
+            if ($p) { $roots += ($p -replace '/', '\') }
+        } catch { }
     }
 
-    $candidates = @()
-    foreach ($root in $roots) {
-        $ws = Join-Path $root 'steamapps\workshop\content\108600'
-        if (Test-Path $ws) { $candidates += $ws }
+    # 2) conventional locations
+    if ($env:ProgramFiles) { $roots += (Join-Path $env:ProgramFiles 'Steam') }
+    if (${env:ProgramFiles(x86)}) { $roots += (Join-Path ${env:ProgramFiles(x86)} 'Steam') }
+    foreach ($extra in @(
+            'D:\Steam', 'D:\SteamLibrary', 'E:\SteamLibrary',
+            'D:\Program Files (x86)\Steam', 'D:\Program Files\Steam',
+            'E:\Program Files (x86)\Steam', 'F:\SteamLibrary')) {
+        $roots += $extra
     }
-    # libraryfolders.vdf driven discovery
+    # Join-Path throws on a drive that does not exist, so drop those roots up front
+    $roots = @($roots | Where-Object { $_ -and [System.IO.Directory]::Exists($_) } | Select-Object -Unique)
+
+    # 3) every library listed in libraryfolders.vdf (this is what actually holds workshop content)
+    $libraries = @()
     foreach ($root in $roots) {
         $vdf = Join-Path $root 'steamapps\libraryfolders.vdf'
-        if (Test-Path $vdf) {
+        if ([System.IO.File]::Exists($vdf)) {
             $content = Get-Content -LiteralPath $vdf -Raw
             foreach ($m in [regex]::Matches($content, '"path"\s+"([^"]+)"')) {
-                $ws = Join-Path ($m.Groups[1].Value -replace '\\\\', '\') 'steamapps\workshop\content\108600'
-                if (Test-Path $ws) { $candidates += $ws }
+                $libraries += ($m.Groups[1].Value -replace '\\\\', '\')
             }
         }
     }
+    $all = @($roots + $libraries | Select-Object -Unique)
 
-    foreach ($c in ($candidates | Select-Object -Unique)) {
+    $candidates = @()
+    foreach ($root in $all) {
+        if (-not [System.IO.Directory]::Exists($root)) { continue }
+        $ws = Join-Path $root 'steamapps\workshop\content\108600'
+        if (Test-Dir $ws) { $candidates += $ws }
+    }
+
+    foreach ($c in $candidates) {
         foreach ($item in (Get-ChildItem -LiteralPath $c -Directory -ErrorAction SilentlyContinue)) {
             $mods = Join-Path $item.FullName 'mods\EscapeFromZomboidFirearms'
-            if (Test-Path (Join-Path $mods $RelPath)) { return $mods }
+            if ([System.IO.File]::Exists((Join-Path $mods $RelPath))) { return $mods }
         }
     }
     return $null
@@ -84,7 +107,7 @@ if (-not $Path) {
 }
 
 $file = Join-Path $Path $RelPath
-if (-not (Test-Path -LiteralPath $file)) {
+if (-not [System.IO.File]::Exists($file)) {
     throw "Not found: $file"
 }
 
@@ -94,7 +117,7 @@ $patched = $text.Contains($Marker)
 
 if ($Revert) {
     if (-not $patched) { Write-Host 'File is not patched, nothing to revert.'; return }
-    $backup = Get-ChildItem -LiteralPath $Path -Recurse -Filter 'TW_AdsFromThird.lua.efzkeepaim.bak' -ErrorAction SilentlyContinue |
+    $backup = Get-ChildItem -LiteralPath $Path -Recurse -Filter '*efzkeepaim*.bak' -ErrorAction SilentlyContinue |
               Sort-Object LastWriteTime -Descending | Select-Object -First 1
     if (-not $backup) { throw 'No backup found; restore the file through Steam (verify integrity).' }
     Copy-Item -LiteralPath $backup.FullName -Destination $file -Force
