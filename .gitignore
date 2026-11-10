@@ -1,0 +1,15 @@
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Backups produced by apply-patch.ps1
+*.bak
+*.efzkeepaim.*.bak
+
+# Local logs / scratch
+*.log
+console.txt
+
+# Editor
+.vscode/
+.idea/

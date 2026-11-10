@@ -1,0 +1,37 @@
+Subject: [PATCH] TW-TPADS: let a keep-ADS patch exempt the post-shot action window
+Target:  EscapeFromZomboidFirearms/42/media/lua/client/TW_AdsFromThird.lua (EFZ v-branch, B42)
+Apply:   patch -p1 < TW_AdsFromThird.lua.patch   (run inside the EscapeFromZomboidFirearms mod folder)
+         or use patches/apply-patch.ps1 for an idempotent, string-based apply.
+
+Why
+---
+`blocked()` in EFZ's third-person ADS module (TW-TPADS) leaves the sight whenever
+`p:getCharacterActions()` is not empty:
+
+    local actions=p:getCharacterActions()
+    if actions and not actions:isEmpty() then return 'action' end
+
+The action state of the shot itself lingers for a few frames after a bolt-action
+rifle is fired. Those frames alone drop the scope, independently of the automatic
+post-shot rack. This hunk asks EFZKeepAim whether the current frame belongs to its
+shot window and, if so, does not treat the action state as a reason to leave.
+
+The exemption is entirely owned by EFZKeepAim (`EFZKeepAim.exempt(player)`) and is
+a no-op when the mod is not installed, so the file remains usable on its own.
+
+--- a/42/media/lua/client/TW_AdsFromThird.lua
++++ b/42/media/lua/client/TW_AdsFromThird.lua
+@@ -141,7 +141,12 @@
+     if p:isSprinting() or p:isFalling() or p:isKnockedDown() then return 'movement' end
+     if not (p:getVariableString('BumpFallType')==nil or p:getVariableString('BumpFallType')=='') then return 'fall' end
+     local actions=p:getCharacterActions()
+-    if actions and not actions:isEmpty() then return 'action' end
++    if actions and not actions:isEmpty() then
++        -- EFZKeepAim (local patch): the action state of the shot itself lingers for a few frames, and leaving
++        -- the sight on that is exactly what the keep-ADS patch removes. Exemption only lasts for its shot window.
++        local keep=rawget(_G,'EFZKeepAim')
++        if not (keep and type(keep.exempt)=='function' and keep.exempt(p)) then return 'action' end
++    end
+     if isGamePaused() then return 'paused' end
+     if UIManager and UIManager.isModalVisible and UIManager.isModalVisible() then return 'modal' end
+     return nil

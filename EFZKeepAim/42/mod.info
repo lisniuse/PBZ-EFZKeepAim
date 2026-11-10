@@ -1,0 +1,3 @@
+name=EFZ Keep ADS (bolt-action)
+id=EFZKeepAim
+description=Keeps you scoped after a shot with a bolt-action / pump weapon while using Escape From Zomboid Firearms. The game queues its automatic post-shot rack as an ISRackFirearm timed action; Viewpoint/EFZ fade ADS for any running action, so the scope drops. This patch removes that just-queued rack while you are aiming (hip fire is untouched, so the automatic rack keeps working when you are not scoped), and stops EFZ's own AutoRack reconciler from queueing it again. Requires Escape From Zomboid Firearms.
