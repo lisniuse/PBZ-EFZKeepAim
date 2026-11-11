@@ -49,24 +49,33 @@ function Test-Dir([string]$p) {
 # ---------------------------------------------------------------------------
 # AnimSets retune
 #
-# Every rack node that is played while aiming carries a transition back to
-# IdleRifle (RackRifleAim -> IdleRifle, playing AimToIdle_Rifle). EFZ ships that
-# transition with m_blendInTime / m_blendOutTime = 0.5 and m_speedScale = 1.3, so
-# finishing a rack costs half a second of the gun dropping out of the sight and
-# another half second of raising it again. That is the "slow re-ADS" the mod
-# cannot fix from Lua, because the transition is baked into the animset.
+# Two separate numbers control how long a rack feels, and both are baked into the
+# animset, so Lua cannot reach either of them.
 #
-# Tightening it to 0.08 / 0.08 at 2.2x keeps the transition (no cut frames, the
-# gun still travels) but makes it read as a snap instead of a swing.
+# 1. Node speed. Rack nodes declare <m_SpeedScale>ReloadSpeed</m_SpeedScale>,
+#    i.e. the character variable the engine fills with 0.8 + perk*0.04. Setting
+#    that variable from Lua does nothing measurable: logging the rack duration
+#    with the multiplier at 1.7x and at 2.3x gives the same 819-825 ms, so the
+#    animation does not read the value we write. Replacing the variable with a
+#    literal makes the clip actually play faster. That is $AnimNodeSpeed.
 #
-# Only transitions whose target is IdleRifle* are touched; node blend times,
-# conditions and events are left alone. Idempotent, and -Revert restores the
-# .efzkeepaim.*.bak copies.
+# 2. The exit transition. A rack started while aiming ends in a transition to
+#    IdleRifle playing AimToIdle_Rifle - the gun dropping out of the sight -
+#    shipped as 0.5s/0.5s at 1.3x. The clip keeps its own length, so tightening
+#    m_blendInTime alone only shortens the cross-fade, not the drop; m_speedScale
+#    is what makes the clip itself play fast. Hence 0.08/0.08 at 3.5x.
+#
+# Rack nodes themselves keep their blend time, conditions and events. Idempotent;
+# -Revert restores the .efzkeepanimset.*.bak copies.
 # ---------------------------------------------------------------------------
 $script:AnimRel = '42\media\AnimSets\player\actions'
 $script:AnimBlendIn = '0.08'
 $script:AnimBlendOut = '0.08'
-$script:AnimSpeed = '2.2'
+$script:AnimSpeed = '3.5'
+$script:AnimNodeSpeed = '2.0'
+
+# 只动长枪。手枪/左轮/双管霰弹的拉栓本来就短，一起提速手感会突变。
+$script:AnimLongGun = @('RackRifle', 'RackLeverAction', 'RackShotgun')
 
 function Invoke-AnimSets([string]$ModPath, [switch]$RevertAnim) {
     $dir = Join-Path $ModPath $script:AnimRel
@@ -75,7 +84,10 @@ function Invoke-AnimSets([string]$ModPath, [switch]$RevertAnim) {
         return
     }
     $files = @(Get-ChildItem -LiteralPath $dir -Filter '*.xml' -File -ErrorAction SilentlyContinue |
-               Where-Object { $_.Name -match 'ack' })
+               Where-Object {
+                   $n = $_.Name
+                   ($script:AnimLongGun | Where-Object { $n.StartsWith($_) }).Count -gt 0
+               })
 
     if ($RevertAnim) {
         $n = 0
@@ -93,6 +105,7 @@ function Invoke-AnimSets([string]$ModPath, [switch]$RevertAnim) {
 
     $script:animFiles = 0
     $script:animEdits = 0
+    $script:animNodes = 0
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 
     $evaluator = [System.Text.RegularExpressions.MatchEvaluator] {
@@ -111,13 +124,22 @@ function Invoke-AnimSets([string]$ModPath, [switch]$RevertAnim) {
         $raw = [System.IO.File]::ReadAllText($f.FullName)
         $before = $script:animEdits
         $new = [regex]::Replace($raw, '(?s)<m_Transitions>.*?</m_Transitions>', $evaluator)
-        if ($script:animEdits -gt $before) {
+
+        # 节点级速度：把 ReloadSpeed 变量换成固定数（见本段顶部说明）
+        $nodeBefore = $script:animNodes
+        $new = [regex]::Replace($new, '(<m_SpeedScale>)ReloadSpeed(</m_SpeedScale>)',
+                                "`${1}$($script:AnimNodeSpeed)`${2}")
+        if ($new -ne $raw) {
+            $script:animNodes += ([regex]::Matches($raw, '<m_SpeedScale>ReloadSpeed</m_SpeedScale>')).Count
+        }
+
+        if ($script:animEdits -gt $before -or $script:animNodes -gt $nodeBefore) {
             Copy-Item -LiteralPath $f.FullName -Destination "$($f.FullName).efzkeepanimset.$stamp.bak" -Force
             [System.IO.File]::WriteAllText($f.FullName, $new, (New-Object System.Text.UTF8Encoding($false)))
             $script:animFiles++
         }
     }
-    Write-Host "AnimSets: $($script:animFiles) file(s), $($script:animEdits) transition(s) retuned"
+    Write-Host "AnimSets: $($script:animFiles) file(s), $($script:animEdits) transition(s), $($script:animNodes) node speed(s) retuned"
 }
 
 

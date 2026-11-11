@@ -56,10 +56,12 @@ local RACK_BLOCK_MS = 500
 local EXEMPT_MS = 1200
 
 -- ====================== 手感（v3 新增，主要就调这里） ======================
--- 拉栓速度倍率。原版拉栓动画的播放速度绑在角色的 ReloadSpeed 变量上（基础 0.8），
--- 乘这个倍率就是"比原版快多少倍"。1.0 = 原版手感，2.3 ≈ 原版 1.84 倍播放速度。
--- 建议区间 1.3 ~ 2.6，超过 2.6 动画会开始发飘。
-local RACK_SPEED = 2.3
+-- 拉栓动画速度现在写在 animset 里（apply-patch.ps1 把 RackRifle/RackShotgun/
+-- RackLeverAction 的 m_SpeedScale 从 ReloadSpeed 变量改成固定 2.0）。原因见下方
+-- speedUp() 的注释：那个变量实测驱动不了动画时长。
+-- 这里保留一个"额外叠加"的开关，默认 1.0 = 不叠加，避免和 animset 相乘。
+-- 想更快/更慢，改 patches/apply-patch.ps1 里的 $AnimNodeSpeed 更直接。
+local RACK_SPEED = 1.0
 
 -- 拉栓动作做到这个比例就把瞄准抬起来（0.32 = 三成就开始回镜），
 -- 动作一结束镜已经就位，不会出现"拉完还要等一下"的空档。0.2~0.6 之间调。
@@ -76,9 +78,9 @@ local REAIM_MS = 450
 local AIM_SNAP = true
 
 -- 第一次估计拉栓动作总时长（毫秒），只用于算回镜进度。跑过一次以后
--- 自动换成实测值（滚动平均），所以不用自己调。这个初值要跟 RACK_SPEED 对得上，
+-- 自动换成实测值（滚动平均），所以不用自己调。这个初值要跟实际速度对得上，
 -- 否则开局第一发会按旧速度估进度、回镜偏晚。
-local RACK_EST_MS = 420
+local RACK_EST_MS = 380
 -- =========================================================================
 
 local function log(fmt, ...)
@@ -313,6 +315,14 @@ end
 --   绑在角色的 ReloadSpeed 变量上。乘这个变量 = 动画和它内部的事件
 --   （playReloadSound@15% / rackBullet@30% / rackingFinished@末端）整体按比例提前，
 --   动作完整播完、不截帧，所以快但不抽帧。
+--
+-- v3.2 实测修正：这条路走不通。
+--   Lua 里把 ReloadSpeed 从 0.8 乘到 1.36（speed 1.7）和 1.84（speed 2.3），
+--   console.txt 里 rack took 都是 819~825ms，一模一样。说明动画系统读的不是
+--   这个角色变量的实时值（或者每帧被重置），乘它等于空转 —— v3 的"有点效果"
+--   其实是 PREAIM_AT + 回镜窗口的功劳，不是速度。
+--   真正的办法是改 animset 把 m_SpeedScale 写成固定数字，见 apply-patch.ps1。
+--   RACK_SPEED 因此默认 1.0，保留只为兼容旧配置。
 
 local function speedUp(action)
     local p = action and action.character
@@ -328,6 +338,7 @@ local function speedUp(action)
         local target = base * RACK_SPEED
         if target > 3 then target = 3 end
         pcall(function() p:setVariable('ReloadSpeed', target) end)
+        log('rack speed var %.2f -> %.2f (may not affect the anim)', base, target)
     end
 
     -- 原版 ISRackFirearm:start 对开镜中的玩家加成：
