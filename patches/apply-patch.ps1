@@ -59,6 +59,14 @@ function Test-Dir([string]$p) {
 #    animation does not read the value we write. Replacing the variable with a
 #    literal makes the clip actually play faster. That is $AnimNodeSpeed.
 #
+#    Careful: speeding the clip up this much makes the engine skip the anim
+#    events inside it (rackBullet, rackingFinished). When rackingFinished never
+#    fires the action has nothing to complete it and hangs until a timeout -
+#    measured 825 ms -> 1729 ms at 2.0x, i.e. faster animation made the rack
+#    *slower*. That is why the mod now hard-cuts the action at RACK_HARD_MS from
+#    Lua instead of relying on the event. Keep both halves together: the animset
+#    number on its own is a trap.
+#
 # 2. The exit transition. A rack started while aiming ends in a transition to
 #    IdleRifle playing AimToIdle_Rifle - the gun dropping out of the sight -
 #    shipped as 0.5s/0.5s at 1.3x. The clip keeps its own length, so tightening
@@ -72,7 +80,7 @@ $script:AnimRel = '42\media\AnimSets\player\actions'
 $script:AnimBlendIn = '0.08'
 $script:AnimBlendOut = '0.08'
 $script:AnimSpeed = '3.5'
-$script:AnimNodeSpeed = '2.0'
+$script:AnimNodeSpeed = '2.2'
 
 # 只动长枪。手枪/左轮/双管霰弹的拉栓本来就短，一起提速手感会突变。
 $script:AnimLongGun = @('RackRifle', 'RackLeverAction', 'RackShotgun')

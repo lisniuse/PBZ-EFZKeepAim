@@ -55,12 +55,19 @@ local VERBOSE = true    -- 排查期打开：控制台会打印 [EFZKeepAim] 开
 local RACK_BLOCK_MS = 500
 local EXEMPT_MS = 1200
 
--- ====================== 手感（v3 新增，主要就调这里） ======================
--- 拉栓动画速度现在写在 animset 里（apply-patch.ps1 把 RackRifle/RackShotgun/
--- RackLeverAction 的 m_SpeedScale 从 ReloadSpeed 变量改成固定 2.0）。原因见下方
--- speedUp() 的注释：那个变量实测驱动不了动画时长。
--- 这里保留一个"额外叠加"的开关，默认 1.0 = 不叠加，避免和 animset 相乘。
--- 想更快/更慢，改 patches/apply-patch.ps1 里的 $AnimNodeSpeed 更直接。
+-- ====================== 手感（v4，主要就调这里） ======================
+-- 【拉栓快慢就看这一个数】拉栓动作总共占多少毫秒，到点强制收工。
+-- 原版实测 825ms。340 大约是原版的 2.4 倍速。想更快给 280，想更顺给 400。
+-- 设 0 = 关闭截断，回到原版时长。
+--
+-- 为什么不用"加速动画"：改 animset 的 m_SpeedScale 会把动画播得太快，动画里的
+-- 事件（rackBullet / rackingFinished）被整帧跳过，rackingFinished 不触发就没法
+-- forceComplete，动作反而悬到超时——实测把节点速度从 ReloadSpeed 改成 2.0 后，
+-- rack took 从 825ms 涨到 1729ms。所以动画速度必须保持原样，只能在 Lua 里卡时间。
+local RACK_HARD_MS = 340
+
+-- 额外叠加的角色变量倍率，1.0 = 不叠加。实测这个变量驱动不了动画时长，
+-- 保留只为兼容旧配置，别再拿它调手感。
 local RACK_SPEED = 1.0
 
 -- 拉栓动作做到这个比例就把瞄准抬起来（0.32 = 三成就开始回镜），
@@ -78,9 +85,9 @@ local REAIM_MS = 450
 local AIM_SNAP = true
 
 -- 第一次估计拉栓动作总时长（毫秒），只用于算回镜进度。跑过一次以后
--- 自动换成实测值（滚动平均），所以不用自己调。这个初值要跟实际速度对得上，
+-- 自动换成实测值（滚动平均），所以不用自己调。要和 RACK_HARD_MS 对得上，
 -- 否则开局第一发会按旧速度估进度、回镜偏晚。
-local RACK_EST_MS = 380
+local RACK_EST_MS = 360
 -- =========================================================================
 
 local function log(fmt, ...)
@@ -395,11 +402,15 @@ local function hookRack()
     local origStart = cls.start
     local origStop = cls.stop
     local origPerform = cls.perform
+    local origUpdate = cls.update
+    local origRackBullet = cls.rackBullet
 
     cls.start = function(self, ...)
         local okA, aiming = pcall(function() return aimState(self.character) end)
         self.twKeepAimAimed = (okA and aiming) or false
         self.twKeepAimDone = false
+        self.twKeepAimCut = false
+        self.twKeepAimRacked = false
         local r = origStart(self, ...)
         -- 提速必须放在原版 start 之后：initVars() 在里面，会把 ReloadSpeed 重置成原版值
         speedUp(self)
@@ -419,10 +430,40 @@ local function hookRack()
         end
     end
 
+    -- 记一下动画事件有没有真的把子弹顶上膛。截断时若还没顶，得自己补一发，
+    -- 否则玩家下一次扣扳机就是空响。
+    if type(origRackBullet) == 'function' then
+        cls.rackBullet = function(self, ...)
+            self.twKeepAimRacked = true
+            return origRackBullet(self, ...)
+        end
+    end
+
+    -- 【核心】不靠动画事件收尾，自己按毫秒卡。原版靠动画播完时触发
+    -- rackingFinished 才 forceComplete，动画一被加速事件就会漏，动作反而悬到超时。
+    if RACK_HARD_MS and RACK_HARD_MS > 0 then
+        cls.update = function(self, ...)
+            if type(origUpdate) == 'function' then origUpdate(self, ...) end
+            if self.twKeepAimCut or self.twKeepAimDone then return end
+            local at = self.twKeepAimAt
+            if not at then return end
+            if (nowMs() - at) < RACK_HARD_MS then return end
+
+            self.twKeepAimCut = true
+            if not self.twKeepAimRacked then
+                self.twKeepAimRacked = true
+                pcall(function() self:rackBullet() end)
+            end
+            log('rack cut at %dms', RACK_HARD_MS)
+            pcall(function() self:forceComplete() end)
+        end
+    end
+
     cls.twKeepAimStop = origStop
     rackHooked = true
-    log('rack hook installed (speed x%.2f, pre-aim at %d%%, re-aim %dms)',
-        RACK_SPEED, math.floor(PREAIM_AT * 100), REAIM_MS)
+    log('rack hook installed (hard %dms, mode=%s, pre-aim at %d%%, re-aim %dms)',
+        RACK_HARD_MS, (RACK_HARD_MS > 0) and 'cut' or 'vanilla',
+        math.floor(PREAIM_AT * 100), REAIM_MS)
     return true
 end
 

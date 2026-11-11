@@ -322,3 +322,40 @@ animset 的备份改用 `.efzkeepanimset.*.bak` 后缀，两套互不干扰。
 
 
 
+## 8. v4：加速 animset 会让动作悬停，必须配 Lua 硬截断
+
+v3.2 把节点 `m_SpeedScale` 从 `ReloadSpeed` 换成固定 `2.0` 之后，实测日志反而变成：
+
+```
+RACK_SPEED 1.7 → rack took 819ms
+RACK_SPEED 2.3 → rack took 825ms
+节点 speed 2.0 → rack took 1729ms / 1880ms   ← 越改越慢
+```
+
+原因不是速度语义反了，而是**动画加速后引擎会跳过动画里的 anim 事件**：
+
+```lua
+-- ISRackFirearm:animEvent
+if event == 'rackingFinished' then
+    self:forceComplete()   -- 唯一的正常收尾路径
+end
+```
+
+`ISRackFirearm.maxTime = -1`、`getDuration()` 返回 `-1`，动作没有时长上限，
+完全靠 `rackingFinished` 事件收尾。动画播太快，这个事件落不到帧上，动作就一直挂着，
+直到别的机制（队列超时/玩家再操作）把它结束——所以时长翻倍。
+
+**结论：animset 加速和 Lua 收尾必须成对出现。** v4 的做法：
+
+1. animset：`m_SpeedScale` → `2.2`（126 个长枪节点），动画本体从 ~660ms 缩到 ~300ms
+2. Lua：hook `ISRackFirearm:update`，从 `start` 起算到 `RACK_HARD_MS`（默认 340ms）就：
+   - 若 `rackBullet` 事件没跑过（`twKeepAimRacked` 为假），手动补一次，保证子弹真的顶上膛
+   - `self:forceComplete()`
+
+hook 时同时包了 `cls.rackBullet` 来置 `twKeepAimRacked`，避免重复上一次膛（多掉一发子弹）。
+`twKeepAimCut` 防重入，`twKeepAimDone` 由 `rackFinished` 置位。
+
+调手感只需要动 `RACK_HARD_MS` 一个数：280 更急、340 默认、400 更顺。`RACK_SPEED`
+（角色 `ReloadSpeed` 变量）确认无效，默认 1.0，留着只为兼容老配置。
+
+顺带记一条排查技巧：`rack took` 突然变大不一定是变慢，很可能是**收尾事件没触发**。
