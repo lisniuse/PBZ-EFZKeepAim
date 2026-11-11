@@ -80,7 +80,7 @@ $script:AnimRel = '42\media\AnimSets\player\actions'
 $script:AnimBlendIn = '0.08'
 $script:AnimBlendOut = '0.08'
 $script:AnimSpeed = '3.5'
-$script:AnimNodeSpeed = '2.2'
+$script:AnimNodeSpeed = '3.0'
 
 # 只动长枪。手枪/左轮/双管霰弹的拉栓本来就短，一起提速手感会突变。
 $script:AnimLongGun = @('RackRifle', 'RackLeverAction', 'RackShotgun')

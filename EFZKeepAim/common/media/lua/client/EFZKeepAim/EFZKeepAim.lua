@@ -55,16 +55,18 @@ local VERBOSE = true    -- 排查期打开：控制台会打印 [EFZKeepAim] 开
 local RACK_BLOCK_MS = 500
 local EXEMPT_MS = 1200
 
--- ====================== 手感（v4，主要就调这里） ======================
+-- ====================== 手感（v5，主要就调这里） ======================
 -- 【拉栓快慢就看这一个数】拉栓动作总共占多少毫秒，到点强制收工。
--- 原版实测 825ms。340 大约是原版的 2.4 倍速。想更快给 280，想更顺给 400。
--- 设 0 = 关闭截断，回到原版时长。
+-- 原版实测 825ms；v4 的 340ms 已经到 2.4 倍速，v5 压到 240ms ≈ 3.4 倍速。
+-- 想更快给 200，想更顺给 300。设 0 = 关闭截断，回到原版时长。
 --
--- 为什么不用"加速动画"：改 animset 的 m_SpeedScale 会把动画播得太快，动画里的
--- 事件（rackBullet / rackingFinished）被整帧跳过，rackingFinished 不触发就没法
--- forceComplete，动作反而悬到超时——实测把节点速度从 ReloadSpeed 改成 2.0 后，
--- rack took 从 825ms 涨到 1729ms。所以动画速度必须保持原样，只能在 Lua 里卡时间。
-local RACK_HARD_MS = 340
+-- 配套：animset 里长枪节点的 m_SpeedScale 现在是 3.0（原版变量换算约 0.8），
+-- 动画本体 ~660ms 压到 ~220ms，正好在这 240ms 里播完，所以截断不会把动作砍一半。
+-- 两者要一起调：只降这个数而动画没加速，动作就会在中途被切断。
+--
+-- 为什么不用"加速动画"单独搞定：动画播太快时 rackingFinished 事件会被整帧跳过，
+-- 动作反而悬到超时（实测 825ms -> 1729ms）。所以收尾必须由这里接管。
+local RACK_HARD_MS = 240
 
 -- 额外叠加的角色变量倍率，1.0 = 不叠加。实测这个变量驱动不了动画时长，
 -- 保留只为兼容旧配置，别再拿它调手感。
@@ -87,7 +89,7 @@ local AIM_SNAP = true
 -- 第一次估计拉栓动作总时长（毫秒），只用于算回镜进度。跑过一次以后
 -- 自动换成实测值（滚动平均），所以不用自己调。要和 RACK_HARD_MS 对得上，
 -- 否则开局第一发会按旧速度估进度、回镜偏晚。
-local RACK_EST_MS = 360
+local RACK_EST_MS = 260
 -- =========================================================================
 
 local function log(fmt, ...)
@@ -505,8 +507,8 @@ local function triggerAutoRack(character, weapon)
     if rackingNow(character) then return end               -- 已经在拉栓 / 换弹
     -- 冷却：跟着实测的拉栓时长走（提速后动作变短，这里不用再干等 0.9 秒），
     -- rackingNow 已经在跑就另有一道闸，按住不放不会连排。
-    local cooldown = (rackMs or RACK_EST_MS) + 120
-    if cooldown < 300 then cooldown = 300 end
+    local cooldown = (rackMs or RACK_EST_MS) + 60
+    if cooldown < 200 then cooldown = 200 end
     if (nowMs() - lastAutoRack) < cooldown then return end
 
     local okC, chambered = pcall(function() return weapon:isRoundChambered() end)
@@ -645,7 +647,7 @@ Events.OnTick.Add(function()
         local ready = false
         if over then
             pendingRack = nil
-        elseif age >= 120 then -- 至少放过这一下空枪攻击的头 120ms
+        elseif age >= 80 then -- 至少放过这一下空枪攻击的头 80ms
             local okB, started = pcall(function() return pr.player:isAttackStarted() end)
             ready = (not okB) or (started ~= true)
             if ready then
