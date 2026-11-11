@@ -145,3 +145,102 @@ end
 npm install luaparse
 node -e "const fs=require('fs'),l=require('luaparse');l.parse(fs.readFileSync(process.argv[1],'utf8'),{luaVersion:'5.1'});console.log('SYNTAX OK')" path\to\file.lua
 ```
+
+---
+
+## 7. v3：拉栓提速 / 回镜提速（手感）
+
+### 7.1 拉栓时长到底由什么决定
+
+`ISRackFirearm:getDuration()` 返回 **-1**，`maxTime = -1`：
+
+```lua
+function ISRackFirearm:new(character, gun)
+    local o = ISBaseTimedAction.new(self, character)
+    o.maxTime = o:getDuration()   -- -1
+```
+
+所以改 `maxTime` 没用。动作长度完全由**动画**决定：动画播到末端触发
+`animEvent 'rackingFinished'` → `forceComplete()`。想快只有两条路：
+
+1. 硬截（提前 `forceComplete()`）—— 抽帧，动作做一半就断，难看
+2. 让动画播快 —— **正解**
+
+### 7.2 动画速度绑在 `ReloadSpeed` 变量上
+
+`media/animsets/player/actions/LoadRifle.xml`：
+
+```xml
+<m_SpeedScale>ReloadSpeed</m_SpeedScale>
+```
+
+`RackRifle.xml` 用 `x_extends="loadRifle.xml"` 继承它，`RackRifleAim.xml` 再继承 `RackRifle.xml`；
+EFZ 的风格化节点（`RackRifleAim_TW_Contact_*`、`RackBreakAction_*`）各自也写了
+`<m_SpeedScale>ReloadSpeed</m_SpeedScale>`。**一个变量盖住所有拉栓动画。**
+
+这个变量由 `ISReloadWeaponAction.setReloadSpeed(character, true)` 写入，原版算式：
+
+```lua
+baseReloadSpeed = 0.8 + character:getPerkLevel(Perks.Reloading) * 0.04
+```
+
+也就是**枪法 0 级时动画只播 0.8 倍速**——本来就慢。`ISRackFirearm:initVars()` 在
+`start()` 里调用它，所以在 `start()` **之后**乘倍率才能覆盖：
+
+```lua
+cls.start = function(self, ...)
+    local r = origStart(self, ...)      -- initVars() 在里面
+    local base = p:getVariableFloat('ReloadSpeed', 0.8)
+    p:setVariable('ReloadSpeed', base * RACK_SPEED)
+    return r
+end
+```
+
+动画加速后，节点里的事件（`playReloadSound`@15%、`rackBullet`@30%、
+`rackingFinished`@末端）**一起按比例提前**，动作仍然是完整播完的，所以快而不抽帧。
+动作结束要把原值写回去，别污染后续的换弹动作。
+
+### 7.3 那笔"瞄准延迟"
+
+`ISRackFirearm:start()` 里还有一段，专门坑回镜：
+
+```lua
+if self.character:isAiming() then
+    self.character:setAimingDelay(self.character:getAimingDelay() + self.gun:getAimingTime() * (0.15 - perk*0.01))
+end
+```
+
+开镜状态下拉栓，原版会**加**一笔抬镜延迟。v3 在 `start()` 之后 `setAimingDelay(0)`，
+并在回镜窗口里每帧压住，抬枪即准。
+
+### 7.4 进度不能用 `getJobDelta`
+
+`ISBaseTimedAction:getJobDelta()` 对 `maxTime <= 1` 的动作基本一直是 0，直到
+`forceComplete()` 才跳到 1。拿它算"做到 70% 就提前回镜"其实永远等到最后一刻才触发
+（v2 的 `PREAIM_AT` 实际上就是这个效果）。v3 改成：
+
+- 记录动作开始时刻，`(now - start) / 实测平均时长` 算进度
+- 实测时长在每次 `stop`/`perform` 时量出来，滚动平均（0.6 旧 + 0.4 新）
+- `getJobDelta` 只在它真给出中间值时优先
+
+### 7.5 可调参数（`EFZKeepAim.lua` 顶部）
+
+| 变量 | 默认 | 作用 | 建议区间 |
+|---|---|---|---|
+| `RACK_SPEED` | 1.7 | 拉栓动画倍率（乘在原版 `ReloadSpeed` 上） | 1.3 ~ 2.2，超过 2.2 会飘 |
+| `PREAIM_AT` | 0.5 | 动作做到多少比例开始回镜 | 0.35 ~ 0.7 |
+| `REAIM_MS` | 380 | 动作结束后强推瞄准的时长（毫秒） | 200 ~ 600 |
+| `AIM_SNAP` | true | 清掉原版那笔抬镜延迟 | 想保留原版精度爬升就设 false |
+| `RACK_EST_MS` | 780 | 首次的时长估计，之后自动实测替换 | 一般不用改 |
+
+调参时看 `console.txt`：
+
+```
+[EFZKeepAim] v3 loaded (KEEP_AIM=true speed=x1.70 preAim=50% reAim=380ms snap=true)
+[EFZKeepAim] rack took 452ms (rolling est 452ms)
+[EFZKeepAim] pre-aim at 50%
+[EFZKeepAim] rack done, re-aim window 380ms
+```
+
+`rack took` 就是你现在的实际拉栓时长；想更快就加 `RACK_SPEED`，看这个数掉到多少。
+

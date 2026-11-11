@@ -28,6 +28,18 @@
     注意：本文件不修改 EFZ 任何文件。但光靠它不够 —— 链路 3 需要 EFZ 侧的
     TW_AdsFromThird.lua 打一行 hook（调用本 mod 导出的 EFZKeepAim.exempt），
     见仓库 patches/apply-patch.ps1。Steam 更新 EFZ 会冲掉那一行，重跑脚本即可。
+
+    v3 手感版（拉栓提速 + 回镜提速）：
+      · 拉栓提速走 ReloadSpeed 变量 —— 所有拉栓动画节点（RackRifle / RackRifleAim /
+        RackBreakAction / EFZ 的 *_TW_* 风格化节点，全都 x_extends 自 LoadRifle.xml
+        或自带 m_SpeedScale=ReloadSpeed）的速度都绑这个变量。乘上去动画整体加速，
+        内部事件（playReloadSound 15% / rackBullet 30% / rackingFinished 末端）一起
+        按比例提前，动作完整播完、不截帧，所以快而不抽帧。
+      · 拉栓开始时清掉原版加的那笔瞄准延迟（setAimingDelay），抬手即准。
+      · 提前回镜从"等一下再推"改成"到 PREAIM_AT 就每帧推着"，且进度改用
+        实测时长换算（原版 maxTime=-1，getJobDelta 到末端才跳 1，靠它算会一直等到最后）。
+      · 回镜窗口改成按毫秒算（REAIM_MS），60Hz 和 144Hz 手感一致。
+      · 自动拉栓的冷却跟着实测时长自适应，不再固定等 0.9 秒。
 ========================================================================== ]]
 
 local MOD = 'EFZKeepAim'
@@ -43,11 +55,29 @@ local VERBOSE = true    -- 排查期打开：控制台会打印 [EFZKeepAim] 开
 local RACK_BLOCK_MS = 500
 local EXEMPT_MS = 1200
 
--- 回镜速度：动作做到这个进度就提前把瞄准抬起来，动作一结束镜已经就位
--- 1.0 = 等动作完全结束才回（最慢）；0.7 = 提前三成；0.0 = 一进动作就抬（等于动作期间硬撑开镜）
-local PREAIM_AT = 0.7
--- 动作结束后强推瞄准的帧数（每帧推一次，防 Java 层每帧把镜压回去）
-local REAIM_FRAMES = 12
+-- ====================== 手感（v3 新增，主要就调这里） ======================
+-- 拉栓速度倍率。原版拉栓动画的播放速度绑在角色的 ReloadSpeed 变量上（基础 0.8），
+-- 乘这个倍率就是"比原版快多少倍"。1.0 = 原版手感，1.7 ≈ 原版 1.7 倍。
+-- 建议区间 1.3 ~ 2.2，超过 2.2 动画会开始发飘。
+local RACK_SPEED = 1.7
+
+-- 拉栓动作做到这个比例就把瞄准抬起来（0.5 = 一半就开始回镜），
+-- 动作一结束镜已经就位，不会出现"拉完还要等一下"的空档。0.35~0.7 之间调。
+local PREAIM_AT = 0.5
+
+-- 拉栓结束后继续强推瞄准的时长（毫秒）。按时间算而不是按帧算，
+-- 这样 144Hz 和 60Hz 的手感一致。
+local REAIM_MS = 380
+
+-- 拉栓开始时把原版加成的那笔"瞄准延迟"清零：原版 ISRackFirearm:start 会
+--   setAimingDelay(getAimingDelay() + getAimingTime()*(0.15 - 枪法等级*0.01))
+-- 这笔延迟就是"拉完栓抬枪发飘"的元凶，清零后抬手即准。
+local AIM_SNAP = true
+
+-- 第一次估计拉栓动作总时长（毫秒），只用于算回镜进度。跑过一次以后
+-- 自动换成实测值（滚动平均），所以不用自己调。
+local RACK_EST_MS = 780
+-- =========================================================================
 
 local function log(fmt, ...)
     if not VERBOSE then return end
@@ -108,6 +138,8 @@ end
 
 local rackingNow = nil -- 定义在下面（前向声明）
 local filling = nil -- 当前装填动作 { player=, action=, aimed=, at= }
+local rackMs = nil -- 实测的拉栓动作总时长（毫秒，滚动平均），算提前回镜进度用
+local reaim = nil -- { player=, untilMs= } 动作结束后强推瞄准的时间窗
 
 -- 装填类动作：拉栓、换弹、插弹匣、退弹（EFZ 的 manualQueueHold 也是这几个）
 local FILL_ACTIONS = {
@@ -269,8 +301,71 @@ rackingNow = function(p)
     return type(cur) == 'table' and FILL_ACTIONS[cur.Type] == true
 end
 
--- 拉栓结束后补几帧瞄准：万一 Java 层在动作期间把镜压下去了，这里把它拉回来
-local reaim = nil -- { player=, at=, left= }
+-- ============ 拉栓手感：整体提速 + 提前回镜（v3） ============
+--
+-- 为什么用 ReloadSpeed 而不是硬截动作：
+--   原版 ISRackFirearm 的 maxTime 是 -1，动作长度完全由动画决定，动画播完时
+--   animEvent 'rackingFinished' 才 forceComplete。所有拉栓动画节点
+--   （RackRifle / RackRifleAim / RackBreakAction / EFZ 的 RackRifleAim_TW_* …
+--   全都 x_extends 自 LoadRifle.xml 或自带 m_SpeedScale=ReloadSpeed）的播放速度
+--   绑在角色的 ReloadSpeed 变量上。乘这个变量 = 动画和它内部的事件
+--   （playReloadSound@15% / rackBullet@30% / rackingFinished@末端）整体按比例提前，
+--   动作完整播完、不截帧，所以快但不抽帧。
+
+local function speedUp(action)
+    local p = action and action.character
+    if not (p and action.gun) then return end
+    if not isLocal(p) then return end
+    action.twKeepAimAt = nowMs()
+
+    if RACK_SPEED ~= 1.0 then
+        -- initVars() 已经跑过，这里读到的是原版算好的 0.8 + 枪法等级*0.04
+        local okB, base = pcall(function() return p:getVariableFloat('ReloadSpeed', 0.8) end)
+        if not okB or type(base) ~= 'number' or base <= 0 then base = 0.8 end
+        if not action.twKeepAimOldSpeed then action.twKeepAimOldSpeed = base end
+        local target = base * RACK_SPEED
+        if target > 3 then target = 3 end
+        pcall(function() p:setVariable('ReloadSpeed', target) end)
+    end
+
+    -- 原版 ISRackFirearm:start 对开镜中的玩家加成：
+    --   setAimingDelay(getAimingDelay() + getAimingTime()*(0.15 - 枪法等级*0.01))
+    -- 这笔延迟就是"拉完栓抬手发飘"的来源，清掉它，抬手即准。
+    if AIM_SNAP and action.twKeepAimAimed then
+        pcall(function() p:setAimingDelay(0) end)
+    end
+end
+
+-- 动作收尾（perform 正常完成 / stop 被打断都会走这里，只处理一次）：
+-- 还原速度变量、记录实测时长、开回镜时间窗
+local function rackFinished(action)
+    if not action or action.twKeepAimDone then return end
+    action.twKeepAimDone = true
+    local p = action.character
+
+    if action.twKeepAimAt then
+        local dur = nowMs() - action.twKeepAimAt
+        if dur > 60 and dur < 5000 then
+            if rackMs then
+                rackMs = rackMs * 0.6 + dur * 0.4 -- 滚动平均，抖两下也不会跳
+            else
+                rackMs = dur
+            end
+            log('rack took %dms (rolling est %dms)', dur, math.floor(rackMs))
+        end
+    end
+
+    if action.twKeepAimOldSpeed and p then
+        local old = action.twKeepAimOldSpeed
+        action.twKeepAimOldSpeed = nil
+        pcall(function() p:setVariable('ReloadSpeed', old) end)
+    end
+
+    if KEEP_AIM and action.twKeepAimAimed and p and isLocal(p) then
+        reaim = { player = p, untilMs = nowMs() + REAIM_MS }
+        log('rack done, re-aim window %dms', REAIM_MS)
+    end
+end
 
 local rackHooked = false
 
@@ -286,25 +381,35 @@ local function hookRack()
 
     local origStart = cls.start
     local origStop = cls.stop
+    local origPerform = cls.perform
 
     cls.start = function(self, ...)
         local okA, aiming = pcall(function() return aimState(self.character) end)
         self.twKeepAimAimed = (okA and aiming) or false
-        return origStart(self, ...)
+        self.twKeepAimDone = false
+        local r = origStart(self, ...)
+        -- 提速必须放在原版 start 之后：initVars() 在里面，会把 ReloadSpeed 重置成原版值
+        speedUp(self)
+        return r
     end
 
     cls.stop = function(self, ...)
         local r = origStop(self, ...)
-        if KEEP_AIM and self.twKeepAimAimed and self.character then
-            reaim = { player = self.character, at = nowMs(), left = REAIM_FRAMES }
-            log('rack done, re-aim queued')
-        end
+        pcall(rackFinished, self)
         return r
+    end
+
+    if type(origPerform) == 'function' then
+        cls.perform = function(self, ...)
+            pcall(rackFinished, self) -- 先排回镜窗口，再让队列往下走
+            return origPerform(self, ...)
+        end
     end
 
     cls.twKeepAimStop = origStop
     rackHooked = true
-    log('rack hook installed')
+    log('rack hook installed (speed x%.2f, pre-aim at %d%%, re-aim %dms)',
+        RACK_SPEED, math.floor(PREAIM_AT * 100), REAIM_MS)
     return true
 end
 
@@ -344,7 +449,11 @@ local function triggerAutoRack(character, weapon)
     if not isLocal(character) or not alive(character) then return end
     if not holds(character, weapon) then return end
     if rackingNow(character) then return end               -- 已经在拉栓 / 换弹
-    if (nowMs() - lastAutoRack) < 900 then return end       -- 拉栓动作本身约 0.6~0.8 秒，按住不放时别反复重排
+    -- 冷却：跟着实测的拉栓时长走（提速后动作变短，这里不用再干等 0.9 秒），
+    -- rackingNow 已经在跑就另有一道闸，按住不放不会连排。
+    local cooldown = (rackMs or RACK_EST_MS) + 120
+    if cooldown < 300 then cooldown = 300 end
+    if (nowMs() - lastAutoRack) < cooldown then return end
 
     local okC, chambered = pcall(function() return weapon:isRoundChambered() end)
     if not okC or chambered == true then return end         -- 膛里有活弹，不用管
@@ -413,6 +522,19 @@ local function dropQueuedRacks(p)
     return dropped
 end
 
+-- 拉栓进度 0~1：优先用动作自己的 jobDelta（引擎给出中间值时最准），
+-- 拿不到就用 (现在 - 动作开始) / 实测平均时长 换算。
+local function progressOf(f)
+    local okD, d = pcall(function() return f.action:getJobDelta() end)
+    if okD and type(d) == 'number' and d > 0.001 then return d end
+    local est = rackMs or RACK_EST_MS
+    if est <= 0 then return 0 end
+    local from = f.at
+    local a = f.action
+    if a and a.twKeepAimAt then from = a.twKeepAimAt end
+    return (nowMs() - from) / est
+end
+
 -- ==================== 事件接线 ====================
 
 Events.OnWeaponSwingHitPoint.Add(function(player, weapon)
@@ -455,47 +577,58 @@ Events.OnTick.Add(function()
         end
     end
 
-    -- 装填动作结束 => 排一次"回镜"；动作没结束时看进度，够快做完了就先抬瞄准
+    -- 装填动作进度：原版 maxTime = -1，getJobDelta 基本一直是 0、到末端才跳 1，
+    -- 所以主力用"实测时长换算的时间进度"，getJobDelta 只在它真给出中间值时优先。
     local f = filling
     if f then
         local has = queueHas(f.player, f.action)
         if has == false or (nowMs() - f.at) > 8000 then
             filling = nil
-            if f.aimed then
-                reaim = { player = f.player, at = nowMs(), left = REAIM_FRAMES }
-                log('fill done, re-aim queued')
+            -- 正常流程 rackFinished 已经排过回镜窗口，这里只做兜底
+            if f.aimed and not reaim then
+                reaim = { player = f.player, untilMs = nowMs() + REAIM_MS }
+                log('fill gone, re-aim window %dms', REAIM_MS)
             end
-        elseif f.aimed and not f.preaimed then
-            -- 提前回镜：动作收尾阶段就把瞄准抬起来，避免"拉完栓还要等一下才开镜"
-            local okD, d = pcall(function() return f.action:getJobDelta() end)
-            if okD and type(d) == 'number' and d >= PREAIM_AT then
-                f.preaimed = true
-                local okA = pcall(function() f.player:setIsAiming(true) end)
-                log('pre-aim at %d%% (%s)', math.floor(d * 100), tostring(okA))
+        elseif f.aimed and aimState(f.player) then
+            local prog = progressOf(f)
+            if prog >= PREAIM_AT then
+                if not f.preaimed then
+                    f.preaimed = true
+                    log('pre-aim at %d%%', math.floor(prog * 100))
+                end
+                -- 到点就一直推着（每帧一次），动作一结束镜就已经在瞄准位置
+                if alive(f.player) then
+                    local okA, actual = pcall(function() return f.player:isAiming() end)
+                    if not (okA and actual == true) then
+                        pcall(function() f.player:setIsAiming(true) end)
+                    end
+                    if AIM_SNAP then
+                        pcall(function() f.player:setAimingDelay(0) end)
+                    end
+                end
             end
         end
     end
 
     local r = reaim
     if r then
-        if r.left <= 0 or (nowMs() - r.at) > 800 then
+        if nowMs() >= r.untilMs then
             reaim = nil
+        elseif not alive(r.player) or not aimState(r.player) then
+            reaim = nil -- 玩家自己取消了开镜，尊重
         else
-            r.left = r.left - 1
-            if alive(r.player) then
-                -- 意图还在（玩家没主动取消）就强推视觉瞄准：EFZ 的 Java 层会把镜压回去，
-                -- 只认 isAiming() 的话这里会一直被它带着走，回镜就慢
-                if not aimState(r.player) then
-                    reaim = nil -- 玩家自己取消了开镜，尊重
-                else
-                    local okA, actual = pcall(function() return r.player:isAiming() end)
-                    if not (okA and actual == true) then
-                        pcall(function() r.player:setIsAiming(true) end)
-                    end
-                end
+            -- 意图还在就强推视觉瞄准：EFZ 的 Java 层会把镜压回去，
+            -- 只认 isAiming() 的话这里会一直被它带着走，回镜就慢
+            local okA, actual = pcall(function() return r.player:isAiming() end)
+            if not (okA and actual == true) then
+                pcall(function() r.player:setIsAiming(true) end)
+            end
+            if AIM_SNAP then
+                pcall(function() r.player:setAimingDelay(0) end)
             end
         end
     end
 end)
 
-log('v2 loaded (KEEP_AIM=%s)', tostring(KEEP_AIM))
+log('v3 loaded (KEEP_AIM=%s speed=x%.2f preAim=%d%% reAim=%dms snap=%s)',
+    tostring(KEEP_AIM), RACK_SPEED, math.floor(PREAIM_AT * 100), REAIM_MS, tostring(AIM_SNAP))
