@@ -5,6 +5,7 @@ Desktop.ini
 # Backups produced by apply-patch.ps1
 *.bak
 *.efzkeepaim.*.bak
+*.efzkeepanimset.*.bak
 
 # Local logs / scratch
 *.log

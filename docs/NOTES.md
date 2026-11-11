@@ -227,20 +227,64 @@ end
 
 | 变量 | 默认 | 作用 | 建议区间 |
 |---|---|---|---|
-| `RACK_SPEED` | 1.7 | 拉栓动画倍率（乘在原版 `ReloadSpeed` 上） | 1.3 ~ 2.2，超过 2.2 会飘 |
-| `PREAIM_AT` | 0.5 | 动作做到多少比例开始回镜 | 0.35 ~ 0.7 |
-| `REAIM_MS` | 380 | 动作结束后强推瞄准的时长（毫秒） | 200 ~ 600 |
+| `RACK_SPEED` | 2.3 | 拉栓动画倍率（乘在原版 `ReloadSpeed` 上） | 1.3 ~ 2.6，超过 2.6 会飘 |
+| `PREAIM_AT` | 0.32 | 动作做到多少比例开始回镜 | 0.2 ~ 0.6 |
+| `REAIM_MS` | 450 | 动作结束后强推瞄准的时长（毫秒） | 200 ~ 600 |
 | `AIM_SNAP` | true | 清掉原版那笔抬镜延迟 | 想保留原版精度爬升就设 false |
-| `RACK_EST_MS` | 780 | 首次的时长估计，之后自动实测替换 | 一般不用改 |
+| `RACK_EST_MS` | 420 | 首次的时长估计，之后自动实测替换 | 跟着 `RACK_SPEED` 一起调 |
 
 调参时看 `console.txt`：
 
 ```
-[EFZKeepAim] v3 loaded (KEEP_AIM=true speed=x1.70 preAim=50% reAim=380ms snap=true)
+[EFZKeepAim] v3 loaded (KEEP_AIM=true speed=x2.30 preAim=32% reAim=450ms snap=true)
 [EFZKeepAim] rack took 452ms (rolling est 452ms)
-[EFZKeepAim] pre-aim at 50%
-[EFZKeepAim] rack done, re-aim window 380ms
+[EFZKeepAim] pre-aim at 32%
+[EFZKeepAim] rack done, re-aim window 450ms
 ```
 
 `rack took` 就是你现在的实际拉栓时长；想更快就加 `RACK_SPEED`，看这个数掉到多少。
+
+### 7.6 拉完栓到开镜那一秒，Lua 改不到
+
+v3 出来后手感已经好很多，但"拉完栓到重新贴上脸"还是有一段明显的拖沓。查下来不在 Lua 层，
+在动画状态机里：
+
+开镜状态下拉栓走的是 `RackRifleAim*` 节点，它带一条**写死的** transition：
+
+```xml
+<m_Transitions>
+    <m_Target>IdleRifle</m_Target>
+    <m_AnimName>TW_Contact_P026_AimToIdle_Rifle</m_AnimName>
+    <m_blendInTime>0.5</m_blendInTime>
+    <m_blendOutTime>0.5</m_blendOutTime>
+    <m_speedScale>1.3</m_speedScale>
+</m_Transitions>
+```
+
+`m_EarlyTransitionOut=true`，所以 `isRacking` / `RackAiming` 一被 `ISRackFirearm:stop()`
+里的 `clearVariable` 清掉，节点立刻按这条 transition 切出去，播一遍 `AimToIdle_Rifle`
+**把枪放下来**（0.5 秒混合、1.3 倍速），Lua 再把 `setIsAiming(true)` 推上去，又是 0.5 秒
+混合**抬回来**。一来一回小一秒，全部发生在拉栓动作已经结束之后。
+
+三条弯路都试不通：
+
+1. **让 `RackAiming` 保持 true** —— transition 是按 `m_Target` 指定目标节点的，不是条件驱动，
+   条件只决定"什么时候转出"，不决定"转到哪"
+2. **拉栓结束立刻重设 `isRacking`** —— `m_Looped=false` 的节点会重新从头播一遍拉栓
+3. **在 Lua 里改 anim node** —— `AnimNode` 没暴露给 Lua，`getAnimNode` 拿不到
+
+最后是**直接改 EFZ 的 animset XML**（`apply-patch.ps1` 里做），把所有 `<m_Target>IdleRifle*`
+的 transition 收成 `0.08 / 0.08 / 2.2`。只动这三个数值，节点本身的 `m_BlendTime`、
+conditions、events 一个不碰，所以是"过渡变快"而不是"跳帧"——枪走过的轨迹还在，只是从
+"甩过去"变成"弹过去"。
+
+实测范围：48 个文件 / 216 处（EFZ 的 `*_TW_Contact_*` 六种握持风格 × 男女 × 各种枪型）。
+原版那 4 个 `Rack*Aim` 节点没动，改游戏本体目录风险太高，而且 EFZ 武器的节点
+`m_ConditionPriority=100` 本来就盖过原版。
+
+**踩的坑**：`apply-patch.ps1 -Revert` 原来用 `-Filter '*efzkeepaim*.bak'` 递归找 hook 备份，
+加上 animset 备份后，它把 XML 的备份当成 `TW_AdsFromThird.lua` 的备份盖了上去，直接把
+lua 变成 XML。现在 hook 的备份精确匹配 `TW_AdsFromThird.lua.efzkeepaim*.bak`，
+animset 的备份改用 `.efzkeepanimset.*.bak` 后缀，两套互不干扰。
+
 

@@ -46,6 +46,81 @@ function Test-Dir([string]$p) {
     return [System.IO.Directory]::Exists($p)
 }
 
+# ---------------------------------------------------------------------------
+# AnimSets retune
+#
+# Every rack node that is played while aiming carries a transition back to
+# IdleRifle (RackRifleAim -> IdleRifle, playing AimToIdle_Rifle). EFZ ships that
+# transition with m_blendInTime / m_blendOutTime = 0.5 and m_speedScale = 1.3, so
+# finishing a rack costs half a second of the gun dropping out of the sight and
+# another half second of raising it again. That is the "slow re-ADS" the mod
+# cannot fix from Lua, because the transition is baked into the animset.
+#
+# Tightening it to 0.08 / 0.08 at 2.2x keeps the transition (no cut frames, the
+# gun still travels) but makes it read as a snap instead of a swing.
+#
+# Only transitions whose target is IdleRifle* are touched; node blend times,
+# conditions and events are left alone. Idempotent, and -Revert restores the
+# .efzkeepaim.*.bak copies.
+# ---------------------------------------------------------------------------
+$script:AnimRel = '42\media\AnimSets\player\actions'
+$script:AnimBlendIn = '0.08'
+$script:AnimBlendOut = '0.08'
+$script:AnimSpeed = '2.2'
+
+function Invoke-AnimSets([string]$ModPath, [switch]$RevertAnim) {
+    $dir = Join-Path $ModPath $script:AnimRel
+    if (-not [System.IO.Directory]::Exists($dir)) {
+        Write-Host "AnimSets folder not found, skipped: $dir"
+        return
+    }
+    $files = @(Get-ChildItem -LiteralPath $dir -Filter '*.xml' -File -ErrorAction SilentlyContinue |
+               Where-Object { $_.Name -match 'ack' })
+
+    if ($RevertAnim) {
+        $n = 0
+        foreach ($f in $files) {
+            $bk = Get-ChildItem -LiteralPath $f.DirectoryName -Filter "$($f.Name).efzkeepanimset*.bak" -ErrorAction SilentlyContinue |
+                  Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($bk) {
+                Copy-Item -LiteralPath $bk.FullName -Destination $f.FullName -Force
+                $n++
+            }
+        }
+        Write-Host "AnimSets reverted: $n file(s)"
+        return
+    }
+
+    $script:animFiles = 0
+    $script:animEdits = 0
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+
+    $evaluator = [System.Text.RegularExpressions.MatchEvaluator] {
+        param($m)
+        $block = $m.Value
+        if ($block -notmatch '<m_Target>IdleRifle') { return $block }
+        if ($block -match "<m_blendInTime>$([regex]::Escape($script:AnimBlendIn))<") { return $block }
+        $b = [regex]::Replace($block, '(<m_blendInTime>)[^<]*(</m_blendInTime>)', "`${1}$($script:AnimBlendIn)`${2}")
+        $b = [regex]::Replace($b, '(<m_blendOutTime>)[^<]*(</m_blendOutTime>)', "`${1}$($script:AnimBlendOut)`${2}")
+        $b = [regex]::Replace($b, '(<m_speedScale>)[^<]*(</m_speedScale>)', "`${1}$($script:AnimSpeed)`${2}")
+        $script:animEdits++
+        return $b
+    }
+
+    foreach ($f in $files) {
+        $raw = [System.IO.File]::ReadAllText($f.FullName)
+        $before = $script:animEdits
+        $new = [regex]::Replace($raw, '(?s)<m_Transitions>.*?</m_Transitions>', $evaluator)
+        if ($script:animEdits -gt $before) {
+            Copy-Item -LiteralPath $f.FullName -Destination "$($f.FullName).efzkeepanimset.$stamp.bak" -Force
+            [System.IO.File]::WriteAllText($f.FullName, $new, (New-Object System.Text.UTF8Encoding($false)))
+            $script:animFiles++
+        }
+    }
+    Write-Host "AnimSets: $($script:animFiles) file(s), $($script:animEdits) transition(s) retuned"
+}
+
+
 function Find-EfzFolder {
     $roots = @()
 
@@ -107,6 +182,10 @@ if (-not $Path) {
 }
 
 $file = Join-Path $Path $RelPath
+
+# 动画集与 hook 补丁互相独立，先各自处理（-Revert 时一起还原）
+if ($Revert) { Invoke-AnimSets -ModPath $Path -RevertAnim } else { Invoke-AnimSets -ModPath $Path }
+
 if (-not [System.IO.File]::Exists($file)) {
     throw "Not found: $file"
 }
@@ -117,7 +196,9 @@ $patched = $text.Contains($Marker)
 
 if ($Revert) {
     if (-not $patched) { Write-Host 'File is not patched, nothing to revert.'; return }
-    $backup = Get-ChildItem -LiteralPath $Path -Recurse -Filter '*efzkeepaim*.bak' -ErrorAction SilentlyContinue |
+    # 精确匹配本文件的备份：不能用 '*efzkeepaim*.bak'，动画集的备份也含这段字符，
+    # 会把 XML 备份盖到 lua 上（踩过一次）。
+    $backup = Get-ChildItem -LiteralPath (Split-Path -Parent $file) -Filter 'TW_AdsFromThird.lua.efzkeepaim*.bak' -ErrorAction SilentlyContinue |
               Sort-Object LastWriteTime -Descending | Select-Object -First 1
     if (-not $backup) { throw 'No backup found; restore the file through Steam (verify integrity).' }
     Copy-Item -LiteralPath $backup.FullName -Destination $file -Force
