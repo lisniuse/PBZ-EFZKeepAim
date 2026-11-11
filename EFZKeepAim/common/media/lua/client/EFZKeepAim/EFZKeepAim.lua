@@ -607,9 +607,35 @@ Events.OnPlayerAttackFinished.Add(function(player, weapon)
     if n > 0 then log('fallback swept %d queued rack', n) end
 end)
 
+-- 兜底：万一时序上 ISRackFirearm:update() 没轮到我们包装的那版，每帧再看一眼。
+-- 两条路任意一条生效就够，谁先到 RACK_HARD_MS 谁收工。
+local function enforceRackCut(p)
+    if not (RACK_HARD_MS and RACK_HARD_MS > 0) then return end
+    if not (p and alive(p)) then return end
+    local Q = rawget(_G, 'ISTimedActionQueue')
+    if type(Q) ~= 'table' then return end
+    local ok, q = pcall(Q.getTimedActionQueue, p)
+    if not ok or type(q) ~= 'table' then return end
+    local a = q.current
+    if type(a) ~= 'table' or a.Type ~= 'ISRackFirearm' then return end
+    if a.twKeepAimDone or a.twKeepAimCut then return end
+    local at = a.twKeepAimAt
+    if not at or (nowMs() - at) < RACK_HARD_MS then return end
+
+    a.twKeepAimCut = true
+    if not a.twKeepAimRacked then
+        a.twKeepAimRacked = true
+        pcall(function() a:rackBullet() end)
+    end
+    log('rack cut at %dms (tick fallback)', RACK_HARD_MS)
+    pcall(function() a:forceComplete() end)
+end
+
 Events.OnTick.Add(function()
     if not guardInstalled or not autoRackHooked or not rackHooked or not attackHooked then ensureGuards() end
     sealFor(-1) -- 只做过期清理
+
+    if getSpecificPlayer then pcall(enforceRackCut, getSpecificPlayer(0)) end
 
     -- 空膛点射之后的补拉栓：等这一下攻击动作结束
     local pr = pendingRack
